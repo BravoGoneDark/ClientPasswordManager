@@ -524,6 +524,37 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   4. `test_entropy_meter_evaluation()`: Verifies Shannon entropy, strength level mapping, and penalties for repeats/sequences.
   5. `test_generator_invalid_inputs()`: Verifies rejection of zero-length requests, empty pool options, and zero word counts.
 
+### 5.10 CLI Interface & Terminal Security Architecture
+
+#### A. Terminal Input Security & Shoulder-Surfing Defense
+* **Headers & Source:** [`include/cli/cli_interface.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/cli/cli_interface.hpp) & [`src/cli/cli_interface.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/cli/cli_interface.cpp)
+* **The Vulnerability (Console Echo & Scrollback Scraping):**
+  * Standard console input (`std::cin >> password`) echoes typed characters in plaintext on the terminal screen.
+  * This exposes master passwords to physical shoulder-surfing, screen recording malware, and terminal scrollback history buffers that persist in shell logs.
+* **The Defense (`read_password_hidden`):**
+  * On Windows, captures keystrokes directly using `_getch()` from `<conio.h>`, bypassing standard console echo buffers.
+  * Masks each typed character with a user-configurable glyph (e.g. `*`) or total silence.
+  * Handles backspace gracefully (`\b \b` sequence: moves cursor back, writes space to erase, moves cursor back again).
+  * Immediately transfers characters into `pwdmgr::crypto::SecureString` and wipes intermediate strings with `pwdmgr::crypto::SecureMemory::zero()`.
+
+#### B. Secure Clipboard Management & Timed Background Scrubbing
+* **The Vulnerability (Persistent Clipboard Scraping):**
+  * Operating system clipboards are globally accessible to all processes running under the user's desktop session.
+  * Leaving passwords on the clipboard allows background scraping tools, web browsers, or subsequent paste operations to harvest credentials long after the user has finished logging in.
+* **The Defense (`ClipboardManager`):**
+  * Interacts directly with Win32 Clipboard APIs: `OpenClipboard()`, `EmptyClipboard()`, `GlobalAlloc(GMEM_MOVEABLE)`, `GlobalLock()`, and `SetClipboardData(CF_TEXT)`.
+  * **Asynchronous Background Purge:** Launches a detached worker thread (`std::thread`) that sleeps for 30 seconds (`std::this_thread::sleep_for`) and automatically invokes `EmptyClipboard()`, permanently purging the plaintext secret from RAM.
+
+#### C. Interactive REPL State Machine & Defensive Workflows
+* **State Machine (`State::Locked` $\leftrightarrow$ `State::Unlocked`):**
+  * Strict access controls: credential querying, viewing, editing, adding, and saving are rejected when the vault is locked.
+* **Dirty State Tracking (`is_dirty_`):**
+  * Tracks in-memory modifications. Prompts the user before locking, switching vaults, or exiting to prevent accidental loss of unsaved changes.
+* **Visual Privacy & List Hygiene:**
+  * The `list` command intentionally omits plaintext passwords from formatted tables, displaying only non-sensitive metadata (Index, Title, Username, URL, Modified timestamp) to avoid flooding terminal scrollback with secrets.
+* **Zero-Knowledge Memory Purging:**
+  * Executing `lock` or exiting the shell immediately invokes `master_password_.clear()` and `vault_->clear()`, wiping the symmetric encryption keys and plaintext entries from RAM using guaranteed non-optimizable zeroing.
+
 ---
 
 ## 6. Detailed Project Roadmap & Status
@@ -559,9 +590,12 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   - Pattern penalties for duplicate and sequential characters.
   - Brute-force crack time estimation for offline GPU rigs and online rate-limited services.
   - Comprehensive generator test suite (`test_generator.cpp`).
-- [ ] **Phase 7: CLI Interface & Terminal Security**
-  - Hidden terminal input for master password (suppressing console echo).
-  - Interactive CLI command loop (`init`, `unlock`, `add`, `list`, `get`, `lock`).
+- [x] **Phase 7: CLI Interface & Terminal Security**
+  - Hidden console password input (`_getch`) suppressing terminal echo (shoulder-surfing defense).
+  - Win32 clipboard integration with 30-second automated asynchronous background scrubber thread.
+  - Interactive REPL shell (`init`, `open`, `add`, `list`, `get`, `copy`, `edit`, `delete`, `search`, `generate`, `strength`, `save`, `lock`, `status`).
+  - Defensive state machine with unsaved modification tracking (`is_dirty_`).
+  - Zero-knowledge volatile memory scrubbing on vault lock and process exit.
 
 ---
 

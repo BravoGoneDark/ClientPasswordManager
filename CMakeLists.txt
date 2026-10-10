@@ -80,6 +80,7 @@ set(CORE_SOURCES
     src/core/vault.cpp
     src/core/generator.cpp
     src/storage/vault_file.cpp
+    src/cli/cli_interface.cpp
 )
 
 add_library(pwdmgr_core STATIC ${CORE_SOURCES})

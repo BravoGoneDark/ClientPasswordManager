@@ -1,12 +1,6 @@
-#include "crypto/secure_memory.hpp"
-#include "crypto/random.hpp"
-#include <iostream>
+#include "cli/cli_interface.hpp"
 
-int main() {
-    std::cout << "========================================" << std::endl;
-    std::cout << "   ClientPasswordManager v1.0.0 (C++)   " << std::endl;
-    std::cout << "   Cybersecurity Vault Core Initialized " << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "\nSecure cryptographic subsystems ready." << std::endl;
-    return 0;
+int main(int argc, char* argv[]) {
+    pwdmgr::cli::CliInterface cli;
+    return cli.run(argc, argv);
 }
