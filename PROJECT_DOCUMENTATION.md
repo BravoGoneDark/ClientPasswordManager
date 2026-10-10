@@ -379,6 +379,91 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   4. `test_vault_serialization_and_scrubbing()`: Verifies secure serialization to `SecureBuffer`, reconstruction via deserialization, and strict rejection of malformed/empty JSON payloads.
   5. `test_integrated_vault_encryption()`: End-to-end integration test combining Phase 3 KDF + AEAD cipher with Phase 4 Vault serialization, verifying roundtrip decryption, wrong password rejection, and bit-flip tamper detection.
 
+### 5.8 Storage Engine & Atomic File Persistence Architecture
+
+#### A. Binary File Format & Packing Mechanics
+* **Headers & Source:** [`include/storage/vault_file.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/storage/vault_file.hpp) & [`src/storage/vault_file.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/storage/vault_file.cpp)
+* **72-Byte Binary Layout:**
+  ```
+  +--------+--------+--------------------+---------------------------------------+
+  | Offset | Size   | Field Name         | Value / Details                       |
+  +--------+--------+--------------------+---------------------------------------+
+  | 0x0000 | 4 B    | Magic Bytes        | ASCII "CPWM" (0x43, 0x50, 0x57, 0x4D) |
+  | 0x0004 | 2 B    | Format Version     | uint16_t (0x0001)                     |
+  | 0x0006 | 1 B    | KDF Identifier     | uint8_t  (0x01 = Argon2id, 0x02 = CNG)|
+  | 0x0007 | 1 B    | Cipher Identifier  | uint8_t  (0x01 = AEAD)                |
+  | 0x0008 | 4 B    | KDF OpsLimit       | uint32_t (e.g. 3 iterations)          |
+  | 0x000C | 4 B    | KDF MemLimit in KB | uint32_t (e.g. 65536 KB = 64 MB)      |
+  | 0x0010 | 16 B   | Cryptographic Salt | 128-bit random salt from CSPRNG       |
+  | 0x0020 | 24 B   | Nonce / IV         | 192-bit random nonce for AEAD cipher  |
+  +--------+--------+--------------------+---------------------------------------+
+  | [Offset 0x0000 - 0x0037 (56 B) bind to AEAD as Associated Authenticated Data]|
+  +--------+--------+--------------------+---------------------------------------+
+  | 0x0038 | 16 B   | Auth Tag (MAC)     | 128-bit Poly1305 / GHASH MAC Tag      |
+  | 0x0048 | N B    | Ciphertext Payload | Encrypted Vault JSON payload          |
+  +--------+--------+--------------------+---------------------------------------+
+  ```
+* **Endian-Independent Serialization:**
+  * Uses explicit little-endian bit-shift encoding (`write_u16_le`, `write_u32_le`, `read_u16_le`, `read_u32_le`).
+  * Prevents compiler structure padding discrepancies and guarantees binary portability across different CPU architectures.
+
+#### B. Associated Authenticated Data (AAD) Header Binding
+* **The Vulnerability (Header Tampering / Downgrade Attacks):**
+  * Encryption alone only protects the ciphertext payload. An adversary with disk access could modify the plaintext file header to launch a downgrade attack:
+    * Decreasing `ops_limit` or `mem_limit` to weaken the Argon2id key derivation difficulty.
+    * Altering the format version or salt.
+* **The AEAD Mitigation:**
+  * The first 56 bytes of the header (`magic` + `version` + `kdf_id` + `cipher_id` + `ops_limit` + `mem_limit_kb` + `salt` + `nonce`) are passed into the cipher as **Associated Authenticated Data (AAD)**.
+  * The AEAD cipher hashes these 56 bytes directly into the 16-byte Poly1305/GHASH authentication tag.
+  * If an attacker alters even a single bit of the salt or KDF iterations in the file header, the MAC verification fails completely during decryption, throwing `pwdmgr::crypto::AuthenticationError`.
+
+#### C. Atomic Write-Replace Persistence Pattern
+* **The Vulnerability (Direct File Truncation):**
+  * Naive file saving (`std::ofstream out("vault.dat", std::ios::trunc)`) immediately zeroes out the destination file.
+  * If an unexpected power outage, crash, battery shutdown, or process termination occurs during the write, the original vault is permanently truncated and destroyed, resulting in catastrophic data loss.
+* **The Write-Flush-Replace Protocol:**
+  ```
+   [In-Memory Vault]
+          │
+          ▼ 1. Encrypt with fresh Salt & Nonce
+   [72B Header + Ciphertext]
+          │
+          ▼ 2. Stream to temporary file in same directory (.tmp)
+   [vault.dat.tmp on disk]
+          │
+          ▼ 3. Force hardware cache flush (FlushFileBuffers)
+   [Committed to Physical Disk Media]
+          │
+          ▼ 4. Atomic Pointer Replacement (ReplaceFileW / MoveFileExW)
+   [vault.dat (Original replaced atomically in a single OS filesystem operation)]
+  ```
+  1. **Same-Directory Staging:** The temporary file (`.vault.tmp`) is created in the exact same directory as the target vault file. This guarantees both files reside on the same filesystem partition/volume, enabling metadata pointer swaps instead of cross-volume data copying.
+  2. **Hardware Cache Sync:** Calls Win32 `FlushFileBuffers()` to force disk drive volatile write-caches to commit blocks to physical non-volatile media before renaming.
+  3. **Atomic Replacement (`ReplaceFileW`):** Calls Win32 `ReplaceFileW()` with `REPLACEFILE_WRITE_THROUGH` (falling back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`). The Windows NTFS/FAT driver replaces the file pointer atomically. If any error occurs before replacement completes, the original vault file remains 100% pristine.
+
+#### D. Vault Loading & Header Inspection
+* **Loading Workflow (`VaultFile::load`):**
+  1. Opens file and verifies size $\ge$ 72 bytes.
+  2. Verifies magic bytes (`"CPWM"`), version, KDF profile, and cipher ID.
+  3. Extracts salt (16B), nonce (24B), and auth tag (16B).
+  4. Reconstructs `KDF::Params` and derives the 256-bit key from the master password.
+  5. Decrypts ciphertext with AAD bound to the first 56 header bytes.
+  6. Deserializes plaintext into a fully initialized `Vault` object.
+* **Header Inspection (`VaultFile::read_header` & `is_vault_file`):**
+  * Reads only the 72-byte header into `VaultHeaderMetadata` without decrypting the payload.
+  * Allows UI/CLI shells to verify file validity and display parameters (KDF difficulty, version) before prompting for password input.
+
+#### E. Storage Unit Test Suite
+* **File:** [`tests/test_storage.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/tests/test_storage.cpp)
+* **Tests Implemented:**
+  1. `test_save_and_load_roundtrip()`: Validates end-to-end saving to disk, reloading, and comparing all credentials.
+  2. `test_header_inspection()`: Verifies `read_header()` decodes metadata and `is_vault_file()` rejects non-vault files.
+  3. `test_atomic_write_replace()`: Modifies an existing vault file, verifies the file updates successfully, and checks no `.tmp` files are left dangling.
+  4. `test_wrong_password_rejection()`: Verifies wrong master password triggers `AuthenticationError`.
+  5. `test_tamper_detection_ciphertext()`: Flips 1 bit in ciphertext on disk and asserts `AuthenticationError` is thrown.
+  6. `test_tamper_detection_header_aad()`: Flips 1 bit in header salt and asserts `AuthenticationError` is thrown due to AAD mismatch.
+  7. `test_corrupted_header_size()`: Tests truncated files and asserts `InvalidHeaderError` is thrown.
+
 ---
 
 ## 6. Detailed Project Roadmap & Status
@@ -400,9 +485,12 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   - Implement `Vault` collection with full CRUD operations and case-insensitive search engine.
   - In-memory serialization to `SecureBuffer` with defensive intermediate memory scrubbing.
   - End-to-end integration test harness (`test_vault.cpp`) verifying crypto-vault pipeline.
-- [ ] **Phase 5: Storage Layer & Atomic Persistence**
-  - Binary file packaging (header, salt, nonce, tag, ciphertext).
-  - Atomic write-replace file persistence.
+- [x] **Phase 5: Storage Layer & Atomic Persistence**
+  - Binary file packaging (72-byte header, salt, nonce, tag, ciphertext).
+  - Associated Authenticated Data (AAD) header binding protecting against tampering.
+  - Atomic write-replace disk persistence (`ReplaceFileW` / `FlushFileBuffers`).
+  - Header inspection without decryption (`read_header`, `is_vault_file`).
+  - Comprehensive storage test harness (`test_storage.cpp`) testing bit-flips, AAD tampering, and atomic swaps.
 - [ ] **Phase 6: Password Generator & Entropy Meter**
   - Unbiased CSPRNG password generation with character set policies.
   - Shannon / Pool-based entropy calculation ($E = L \times \log_2(R)$).
