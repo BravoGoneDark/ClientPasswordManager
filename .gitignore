@@ -1,0 +1,27 @@
+# Build & Output Directories
+build/
+bin/
+out/
+
+# Visual Studio / MSVC Artifacts
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.idb
+
+# CMake Artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Runtime & Vault Data
+*.vault
+*.vault.tmp
+*.tmp
+*.log

@@ -1,0 +1,542 @@
+# ClientPasswordManager - Master Project Documentation & Knowledge Base
+
+> **CRITICAL DIRECTIVE FOR ALL FUTURE AI SESSIONS:**  
+> This document is the single source of truth for the architecture, concepts, implementation details, and syntax rationale.  
+> Whenever any code or module is added or updated, **you must explain each and every concept and C++ syntax/technology pattern used** in this documentation so the user can learn and reference it without having to re-prompt.
+
+---
+
+## 1. Project Overview & CyberSec Objectives
+
+**ClientPasswordManager** is an offline, zero-knowledge, cryptographically robust password manager written in C++ for Windows. It provides a local vault where credentials (services, usernames, passwords, notes, URLs) can be securely stored, queried, and updated.
+
+### Core Security Goals
+1. **Zero-Knowledge Architecture:** The master password is never written to disk, never sent over a network, and never retained unencrypted in memory longer than necessary.
+2. **Confidentiality:** High-grade symmetric encryption (AEAD) ensures that an attacker possessing the `.vault` file cannot read any plaintext credentials.
+3. **Authenticity & Integrity:** Tampering with any byte of the ciphertext or file headers is detected immediately prior to decryption.
+4. **Brute-Force & GPU Resistance:** Key derivation is intentionally memory-hard and computationally expensive (Argon2id), rendering mass dictionary or ASIC attacks infeasible.
+5. **Memory Forensics Resistance:** Plaintext passwords and derived keys are shielded from memory dumpers, compiler dead-code elimination, and disk paging.
+
+---
+
+## 2. Threat Modeling (STRIDE Analysis)
+
+| Threat Category | Attack Vector | Mitigation Implemented |
+| :--- | :--- | :--- |
+| **Spoofing** | Attacker substitutes a fraudulent vault file | Authenticated header validation and AEAD tag verification. |
+| **Tampering** | Attacker flips bits in the ciphertext or alters salt/iterations | Authenticated Encryption with Associated Data (AEAD) authenticates both ciphertext and headers. |
+| **Repudiation** | Vault corruption blamed on software bug | Atomic file write-replace pattern prevents partial writes and file corruption. |
+| **Information Disclosure** | Vault file stolen from disk (`pagefile.sys` or unencrypted disk backup) | AES-256-GCM / XChaCha20 encryption; OS memory locking (`VirtualLock`) prevents paging secrets to disk. |
+| **Denial of Service** | Corrupted vault file crashing the application | Strict binary parser boundaries, error handling, and file integrity pre-checks. |
+| **Elevation of Privilege** | Memory scraper/dumper harvesting keys from volatile memory | Secure zeroing (`SecureZeroMemory` / `sodium_memzero`) and RAII zeroizing wrappers. |
+
+---
+
+## 3. Cryptographic Concepts & Deep-Dive Explanation
+
+### 3.1 Authenticated Encryption with Associated Data (AEAD)
+* **The Problem with Classical Encryption (ECB, CBC):**
+  * **ECB (Electronic Codebook):** Encrypts identical blocks into identical ciphertext. Leaks structural patterns (famous "ECB Penguin").
+  * **CBC (Cipher Block Chaining):** Provides confidentiality, but lacks integrity. Without a separate Message Authentication Code (HMAC), it is vulnerable to **Padding Oracle Attacks** (e.g., POODLE) and bit-flipping attacks where an attacker alters ciphertext to produce predictable plaintext mutations.
+* **Why AEAD is Mandatory:**
+  * AEAD algorithms (e.g., **AES-256-GCM** or **XChaCha20-Poly1305**) produce both **ciphertext** and an **Authentication Tag (MAC)** in a single cryptographic pass.
+  * If an attacker alters even 1 bit of the ciphertext, the MAC verification fails completely, and the decryption algorithm throws an authentication error without processing malformed plaintext.
+* **Nonce / Initialization Vector (IV) Hygiene:**
+  * **Nonce** stands for "Number used Once".
+  * In AES-GCM or ChaCha20, **reusing a nonce with the same key is a catastrophic cryptographic failure**. Nonce reuse leaks the authentication key and allows an adversary to decrypt messages or forge signatures.
+  * Every single vault write operation must generate a fresh, cryptographically random nonce.
+
+### 3.2 Key Derivation Functions (KDF: Argon2id vs. PBKDF2)
+* **Why Fast Hashes (SHA-256 / MD5) Fail for Passwords:**
+  * Standard hash functions are engineered for speed (modern GPUs calculate billions of SHA-256 hashes per second). An attacker can brute-force an 8-character password in minutes.
+* **The Solution: Key Stretching & Memory-Hardness:**
+  * **Argon2id:** Winner of the 2015 Password Hashing Competition (PHC). It combines **Argon2d** (resistant to GPU cracking via memory-dependent data access) and **Argon2i** (resistant to side-channel cache-timing attacks).
+  * **Memory Hardness:** Requires the computation to allocate and shuffle through megabytes of RAM (e.g., 64 MB), bottlenecking GPU and ASIC cracking rigs that lack massive per-thread memory.
+* **Cryptographic Salt:**
+  * A 16–32 byte unique random value generated by a CSPRNG.
+  * Stored in plaintext in the vault file header.
+  * Ensures two vaults with identical master passwords produce entirely different encryption keys, rendering precomputed Rainbow Tables useless.
+
+### 3.3 Cryptographically Secure Pseudo-Random Number Generation (CSPRNG)
+* **The Danger of `rand()` or `std::mt19937`:**
+  * Standard pseudorandom functions are deterministic and designed for statistics/simulations, not security. Given a few consecutive outputs, the internal state can be computed, allowing an attacker to predict future salts, nonces, and passwords.
+* **CSPRNG Implementation:**
+  * Must query unpredictable physical entropy pools collected by the OS (keystroke timing, thermal noise, interrupt timings).
+  * On Windows: `BCryptGenRandom` or `CryptGenRandom`.
+  * Through Libsodium: `randombytes_buf()`.
+
+### 3.4 Memory Security & Defensive Systems Programming
+* **Compiler Dead-Code Elimination:**
+  * Modern compilers optimize code aggressively. If a buffer `char key[32]` is zeroed using `memset(key, 0, 32);` immediately before a function returns or the object is deleted, the compiler notices `key` is never read again and **completely deletes the memset call**!
+  * **Countermeasure:** Must use volatile-guaranteed zeroization:
+    * Windows API: `SecureZeroMemory()`
+    * Libsodium: `sodium_memzero()`
+* **Memory Paging / Swapping:**
+  * Operating systems continuously swap idle memory pages to disk (`pagefile.sys` on Windows). If sensitive pages are swapped, secrets are written to unencrypted physical storage.
+  * **Countermeasure:** `VirtualLock()` informs the Windows Virtual Memory Manager to lock the specified address range in physical RAM, preventing it from being paged to disk.
+* **Crash Dumps & Core Dumps:**
+  * An unexpected crash could generate a memory dump containing secrets. Secure buffers should be wiped immediately as soon as intermediate cryptographic operations finish.
+
+### 3.5 Atomic File Persistence (Write-Replace Pattern)
+* If power is lost or the application is terminated midway through writing a 50KB vault file, a direct write will leave the file corrupted and truncated—destroying user credentials forever.
+* **Atomic Protocol:**
+  1. Write the new encrypted vault to a temporary file in the same directory: `vault.dat.tmp`.
+  2. Flush the OS file buffers to physical disk (`FlushFileBuffers` on Windows / `fsync`).
+  3. Atomically rename/replace the old file with the new file (`std::filesystem::rename` or Windows `ReplaceFileW`).
+  4. The old vault remains 100% intact until the new vault is guaranteed on disk.
+
+---
+
+## 4. Vault Binary File Specification
+
+Every `.vault` file on disk adheres to this exact binary structure:
+
+```
++--------+--------+---------------------------------------------------------+
+| Offset | Size   | Field Name       | Purpose / Details                    |
++--------+--------+---------------------------------------------------------+
+| 0x0000 | 4 B    | Magic Bytes      | ASCII "CPWM" (Client Password Mgr)   |
+| 0x0004 | 2 B    | Version          | uint16_t (e.g. 0x0001)               |
+| 0x0006 | 1 B    | KDF Identifier   | 0x01 = Argon2id                      |
+| 0x0007 | 1 B    | Cipher Identifier| 0x01 = XChaCha20-Poly1305 / AES-GCM  |
+| 0x0008 | 4 B    | KDF OpsLimit     | uint32_t (Iterations / passes)       |
+| 0x000C | 4 B    | KDF MemLimit     | uint32_t (Argon2 memory in KB)       |
+| 0x0010 | 16 B   | Salt             | Unique random salt for KDF           |
+| 0x0020 | 24 B   | Nonce / IV       | Unique random IV for cipher          |
+| 0x0038 | 16 B   | Auth Tag (MAC)   | Message authentication tag           |
+| 0x0048 | N B    | Ciphertext       | Encrypted JSON payload               |
++--------+--------+---------------------------------------------------------+
+```
+
+*Note: All header bytes from offset `0x0000` to `0x0037` are included as **Associated Authenticated Data (AAD)** in the cipher so that tampering with parameters or the salt invalidates the MAC.*
+
+---
+
+## 5. C++ Architecture, Patterns & Syntax Rationale
+
+### 5.1 RAII (Resource Acquisition Is Initialization) for Secrets
+In standard C++, handling raw pointers (`uint8_t* key = new uint8_t[32]`) risks memory leaks if exceptions occur, leaving keys lingering in heap memory.
+* **Syntax / Pattern:** Custom `SecureBuffer` and `SecureString` classes.
+* **Mechanism:**
+  ```cpp
+  class SecureBuffer {
+  private:
+      std::vector<uint8_t> buffer_;
+  public:
+      ~SecureBuffer() {
+          if (!buffer_.empty()) {
+              sodium_memzero(buffer_.data(), buffer_.size());
+          }
+      }
+      // Disable copy construction to avoid duplicating plaintext secrets across RAM
+      SecureBuffer(const SecureBuffer&) = delete;
+      SecureBuffer& operator=(const SecureBuffer&) = delete;
+      // Allow move construction for efficient transfer
+      SecureBuffer(SecureBuffer&&) noexcept = default;
+      SecureBuffer& operator=(SecureBuffer&&) noexcept = default;
+  };
+  ```
+
+### 5.2 Modern C++ Semantics
+* `std::span<const uint8_t>`: Non-owning, safe memory views that pass byte buffers without copying memory.
+* `std::filesystem`: Cross-platform, safe filesystem manipulation (atomic renames, path normalization).
+* `std::unique_ptr` / RAII locks: Automated lifecycle management preventing resource exhaustion.
+
+### 5.3 Build System Hardening & Security Compiler Flags (MSVC)
+In low-level security and exploit defense, writing safe C++ code is only half the battle; the compiler and linker must harden the emitted binary against exploitation techniques:
+
+* **/GS (Buffer Security Check - Stack Canaries):**
+  * Injects a random cookie (canary) between local stack variables and the function's return address.
+  * Before the function returns, the CPU checks if the canary has been modified.
+  * If a stack buffer overflow occurs and overwrites the return pointer, the canary check fails, and the process immediately terminates (`__report_gsfailure`) before an attacker can hijack the instruction pointer (`RIP`).
+* **/guard:cf (Control Flow Guard - CFG):**
+  * Microsoft's exploit mitigation technology against Return-Oriented Programming (ROP) and indirect call hijacking.
+  * Enforces a bitmap of valid target addresses for indirect function calls, preventing an attacker from diverting execution flow to arbitrary gadgets.
+* **/DYNAMICBASE (ASLR - Address Space Layout Randomization):**
+  * Informs the Windows PE loader to randomize the base memory address of the executable and DLLs on each launch.
+  * Defeats hardcoded address exploits (such as jumping to known shellcode or fixed libc addresses).
+* **/HIGHENTROPYVA (64-bit High-Entropy ASLR):**
+  * Enables the full 64-bit address space (up to 24 bits of entropy / terabytes of possible address ranges) for randomization, making brute-force memory guessing statistically impossible.
+* **/NXCOMPAT (DEP - Data Execution Prevention):**
+  * Enforces the CPU hardware `NX` (No-Execute) / `XD` (Execute-Disable) bit on memory pages.
+  * Marks stack and heap pages as Non-Executable (`PAGE_READWRITE`). If an attacker injects shellcode into a heap buffer, the CPU raises an access violation hardware exception immediately when execution is attempted.
+* **/sdl (Security Development Lifecycle Checks):**
+  * Enables extra compiler-time runtime warnings, treating risky C runtime functions (like unconstrained `strcpy` or `sprintf`) as compilation errors and enabling strict pointer checks.
+* **Modern CMake Target-Based Architecture:**
+  * Rather than global compiler variables (`CMAKE_CXX_FLAGS`), modern CMake uses target-based scoping (`target_include_directories`, `target_link_libraries`).
+  * `PUBLIC` headers/libraries are exposed to any consumer target, while `PRIVATE` flags only apply to the implementation target, preventing dependency pollution.
+
+### 5.4 Secure Memory & CSPRNG Implementation Breakdown
+
+#### A. Copy Deletion vs. Move Semantics in `SecureBuffer`
+* **Syntax:**
+  ```cpp
+  SecureBuffer(const SecureBuffer&) = delete;
+  SecureBuffer& operator=(const SecureBuffer&) = delete;
+  SecureBuffer(SecureBuffer&& other) noexcept;
+  ```
+* **Security Rationale:**
+  * When an object is copied (pass-by-value, standard assignment), a duplicate of the underlying byte vector is allocated on the heap. If an exception or early return occurs, the copy might not be cleanly wiped, leaving orphaned plaintext secrets in unmanaged heap segments.
+  * Deleting the copy constructor forces developers to pass references or explicitly transfer ownership via **Move Semantics** (`std::move`). Move semantics transfer the internal pointer without duplicating the secret bytes in RAM.
+
+#### B. Memory Pinning via `VirtualLock` (Windows API)
+* **Syntax:** `VirtualLock(ptr, size)` and `VirtualUnlock(ptr, size)`
+* **Security Rationale:**
+  * Modern operating systems swap inactive memory pages out of physical RAM to disk (`pagefile.sys`). If a page containing the master key is paged out, an attacker who acquires raw disk access or an unencrypted volume backup can recover the key forensically.
+  * `VirtualLock` requests that the Windows Virtual Memory Manager pin the specified memory range into physical RAM, blocking the paging subsystem from writing those pages to disk.
+
+#### C. Modulo Bias & Rejection Sampling in `Random::get_uniform_u32`
+* **The Vulnerability (Modulo Bias):**
+  * When mapping a random 32-bit number $R \in [0, 2^{32}-1]$ into a range $[0, N-1]$ using the naive formula $R \pmod N$, a bias occurs if $2^{32}$ is not an exact multiple of $N$.
+  * The numbers in the lower remainder range have an extra probability quantum of occurring:
+    $$\Pr(X) = \frac{\lfloor 2^{32} / N \rfloor + 1}{2^{32}} \quad \text{vs} \quad \frac{\lfloor 2^{32} / N \rfloor}{2^{32}}$$
+  * In cryptographic password generators, this statistical skew degrades entropy and allows attackers to prioritize certain character distributions in brute-force dictionaries.
+* **The Mitigation (Rejection Sampling):**
+  * We compute the largest multiple of $N$ that fits inside $2^{32}$: $\text{limit} = 2^{32} - (2^{32} \pmod N)$.
+  * Any generated 32-bit value that is $\ge \text{limit}$ is discarded, and a new random integer is drawn from the CSPRNG.
+  * Every outcome within $[0, N-1]$ now has an identical probability: $\frac{1}{N}$.
+
+#### D. Non-Owning Memory Views (`std::span`)
+* **Syntax:** `std::span<const uint8_t>`
+* **C++ Rationale:**
+  * Introduced in C++20, `std::span` represents a contiguous sequence of objects without owning them (essentially a `{pointer, size}` tuple).
+  * It avoids unnecessary buffer copying when passing raw arrays, vectors, or strings into cryptographic functions, reducing heap churn and minimizing the memory footprint of sensitive data.
+
+### 5.5 Header Files (`.hpp`) vs Implementation Files (`.cpp`) & The Compilation Model
+
+#### A. What is an `.hpp` File?
+* `.hpp` stands for **Header C++** (equivalent to `.h` in C, but explicitly signaling C++ features like classes, templates, and namespaces).
+* In C++, source code is split into two complementary file types:
+  1. **Header Files (`.hpp`):** Contain **Declarations** (the blueprint, function prototypes, class layouts, member variable types). Tells the compiler *what exists* and *how to call it*.
+  2. **Source Files (`.cpp`):** Contain **Definitions** (the actual implementation code and algorithm logic). Tells the compiler *how it actually works*.
+
+#### B. The C++ Compilation Pipeline
+```
+ [secure_memory.hpp] (Interface)
+         │  included via #include
+         ▼
+ [secure_memory.cpp] ──(Compiler)──► [secure_memory.obj] ┐
+                                                          ├──(Linker)──► [ClientPasswordManager.exe]
+ [main.cpp]          ──(Compiler)──► [main.obj]          ┘
+ (also includes .hpp)
+```
+1. **Preprocessing:** `#include "crypto/secure_memory.hpp"` literally copies the contents of `secure_memory.hpp` into any file that requests it.
+2. **Compilation (Translation Units):** Each `.cpp` is compiled into an independent binary object file (`.obj` on Windows, `.o` on Linux). `main.cpp` can compile without knowing *how* `SecureBuffer` is implemented—it only needs the `.hpp` to know its size, methods, and types.
+3. **Linking:** The linker resolves function calls between `main.obj` and `secure_memory.obj`, stitching them into the final `.exe`.
+
+#### C. Role of `#pragma once`
+* At the top of every `.hpp` file, `#pragma once` is an include guard.
+* It instructs the preprocessor to include the file only once per translation unit, preventing redefinition errors when multiple files include the same header.
+
+#### D. Security & Architectural Significance
+* **API Surface Isolation:** Headers allow strict public vs. private separation. Consumers of `pwdmgr::crypto::SecureBuffer` interact only with documented methods, while raw pointer allocations or platform-specific Windows APIs (`VirtualLock`) remain isolated in the `.cpp`.
+* **Reduced Blast Radius:** Modifying algorithm logic inside `.cpp` does not require recompiling every dependent file, speeding up builds and reducing ripple effects across security modules.
+
+### 5.6 Cryptographic Engine Architecture (KDF & AEAD)
+
+#### A. Key Derivation Function (KDF) Subsystem
+* **Header & Source:** [`include/crypto/kdf.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/crypto/kdf.hpp) & [`src/crypto/kdf.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/crypto/kdf.cpp)
+* **Algorithm:** **Argon2id** (with Windows CNG PBKDF2-HMAC-SHA256 fallback).
+* **Security Mechanics:**
+  * Raw user master passwords possess low Shannon entropy (typically 30–60 bits).
+  * The KDF algorithm performs **Key Stretching**: executing computationally expensive memory operations to make password guesses take hundreds of milliseconds per try.
+  * `ops_limit` defines the number of sequential hashing iterations (CPU cost).
+  * `mem_limit` defines the dedicated memory buffer in bytes (e.g., 64 MB for interactive profile). Because GPUs and ASICs have limited ultra-fast cache per core, forcing the algorithm to fill 64 MB of RAM halts parallelized mass-cracking rigs.
+  * The 16-byte cryptographically random **Salt** ensures identical master passwords produce entirely different keys across vaults, neutralizing Rainbow Tables.
+
+#### B. Authenticated Encryption with Associated Data (AEAD)
+* **Header & Source:** [`include/crypto/cipher.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/crypto/cipher.hpp) & [`src/crypto/cipher.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/crypto/cipher.cpp)
+* **Algorithms:** **XChaCha20-Poly1305** (Libsodium) and **AES-256-GCM** (Windows CNG).
+* **The `CiphertextPackage` Struct:**
+  ```cpp
+  struct CiphertextPackage {
+      SecureBuffer ciphertext;
+      SecureBuffer tag; // 16-byte MAC authentication tag
+  };
+  ```
+* **Associated Authenticated Data (AAD):**
+  * Encryption ciphers normally only protect the payload. However, an attacker might tamper with metadata in the file header (such as altering the version byte or downgrading KDF iterations).
+  * AAD allows us to pass file headers into the cipher. The headers are **not encrypted** (remain readable), but they are **cryptographically hashed into the authentication tag**. If an attacker tampers with a single bit of the file header, authentication fails immediately.
+* **Tamper Rejection (`AuthenticationError`):**
+  * When decrypting, the cipher calculates the MAC over `{AAD + Ciphertext}` and compares it to the stored `tag` in constant time.
+  * If the password is wrong, or if even 1 bit of ciphertext/tag/header was modified (bit-flip attack), the cipher refuses to decrypt and throws `pwdmgr::crypto::AuthenticationError`.
+
+#### C. Cryptographic Unit Test Harness
+* **File:** [`tests/test_crypto.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/tests/test_crypto.cpp)
+* **Tests Implemented:**
+  1. `test_secure_memory()`: Verifies zeroization, buffer allocations, and ownership transfer via move semantics.
+  2. `test_random()`: Verifies CSPRNG non-determinism and unbiased integer generation across ranges.
+  3. `test_kdf_and_cipher()`: Tests full encryption/decryption roundtrips, validates that bit-flipping the ciphertext throws `AuthenticationError`, and confirms wrong master passwords are strictly rejected.
+
+### 5.7 Vault Data Structure & In-Memory Serialization Architecture
+
+#### A. RFC 4122 Version 4 UUID Generation & Validation
+* **Headers & Source:** [`include/core/uuid.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/core/uuid.hpp) & [`src/core/uuid.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/core/uuid.cpp)
+* **What is a UUID v4?**
+  * A Universally Unique Identifier (UUID) v4 is a 128-bit identifier generated using cryptographically strong pseudo-random numbers (RFC 4122).
+  * Canonical format: 32 hexadecimal digits displayed in 5 groups separated by hyphens (`8-4-4-4-12`): `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.
+* **Bitwise Mechanics & RFC Conformance:**
+  1. **Entropy Generation:** 16 random bytes are drawn directly from the OS kernel CSPRNG via `pwdmgr::crypto::Random::fill()`.
+  2. **Version Nibble (4 bits):** The 4 most significant bits of octet 7 (`bytes[6]`) are set to `0b0100` (Version 4):
+     ```cpp
+     bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);
+     ```
+  3. **Variant Bits (2 bits):** The 2 most significant bits of octet 9 (`bytes[8]`) are set to `0b10` (Variant 1 - RFC 4122):
+     ```cpp
+     bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);
+     ```
+  4. **Validation:** `Uuid::is_valid()` verifies string length (36), exact hyphen indices (8, 13, 18, 23), version nibble (`'4'`), and variant characters (`'8'`, `'9'`, `'a'`, `'b'`).
+* **Security Rationale:**
+  * Auto-incrementing integer IDs (`1, 2, 3...`) leak total account counts and are vulnerable to enumeration attacks.
+  * A 122-bit random UUID provides $2^{122} \approx 5.3 \times 10^{36}$ unique values, rendering collisions mathematically impossible.
+
+#### B. Credential Domain Model (`CredentialEntry`)
+* **Headers & Source:** [`include/core/credential.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/core/credential.hpp) & [`src/core/credential.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/core/credential.cpp)
+* **Fields Encapsulated:**
+  * `uuid_`: Unique RFC 4122 v4 identifier.
+  * `title_`: Platform/Service name (e.g. "GitHub", "AWS Console").
+  * `username_`: Login identifier, email, or account ID.
+  * `password_`: Encapsulated inside `pwdmgr::crypto::SecureString` (guaranteeing memory wiping on destruction).
+  * `url_`: Associated login endpoint or URL.
+  * `notes_`: Freeform notes, recovery codes, or security question answers.
+  * `created_at_` & `updated_at_`: UTC epoch timestamps in seconds.
+* **Deleted Copy Operations (`= delete`):**
+  * Passwords must not be copied implicitly. By deleting `CredentialEntry(const CredentialEntry&)` and `operator=`, passing an entry by value or creating accidental duplicates generates a compilation error.
+  * Explicit `clone()` method: When copying is genuinely required, the caller must invoke `entry.clone()`, making secret replication explicit in code.
+* **Move Semantics (`noexcept`):**
+  * Supports zero-copy transfers (`std::move`) into the vault container, ensuring no residual heap fragments remain from temporary objects.
+* **Time Tracking with `std::chrono`:**
+  * Stores timestamps as `uint64_t` UTC epoch seconds using `std::chrono::system_clock::now().time_since_epoch()`.
+  * Avoids timezone parsing ambiguities and simplifies sorting and comparisons.
+
+#### C. In-Memory Vault Collection (`Vault`)
+* **Headers & Source:** [`include/core/vault.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/core/vault.hpp) & [`src/core/vault.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/core/vault.cpp)
+* **CRUD Mechanics:**
+  * `add_entry()`: Automatically generates a UUID v4 if not provided, sets timestamps, appends entry, and updates vault modification time.
+  * `get_entry()`: Returns `CredentialEntry*` or `const CredentialEntry*` without heap allocation.
+  * `update_entry()`: Atomically updates an existing entry while preserving original creation timestamps.
+  * `delete_entry()`: Erases entry and updates vault modification timestamp.
+* **Case-Insensitive Search Engine:**
+  * Implements `std::search` with `std::tolower` comparison predicates.
+  * `find_by_title(query, exact)`: Supports exact and substring matching.
+  * `find_by_username(query, exact)`: Searches accounts by login/email.
+  * `search(query)`: Full-text multi-field search across title, username, URL, and notes simultaneously.
+
+#### D. JSON Serialization & Intermediate Memory Scrubbing
+* **The Forensic Threat of Naive Serialization:**
+  * Serialization libraries typically format JSON into standard `std::string` buffers.
+  * When a standard string goes out of scope or reallocates, the C++ runtime frees the heap block without overwriting its contents.
+  * Plaintext passwords of the **entire vault** remain lingering in unallocated heap memory, easily extracted by an unprivileged process reading process RAM or inspecting crash dumps.
+* **The Secure Serialization Protocol (`serialize_secure()`):**
+  ```cpp
+  SecureBuffer Vault::serialize_secure() const {
+      nlohmann::json root = to_json();
+      std::string serialized = root.dump();
+
+      SecureBuffer sec_buf(serialized.size());
+      if (!serialized.empty()) {
+          std::memcpy(sec_buf.data(), serialized.data(), serialized.size());
+          // CRITICAL: Scrub intermediate string before it is deallocated
+          SecureMemory::zero(serialized.data(), serialized.size());
+      }
+      serialized.clear();
+      return sec_buf;
+  }
+  ```
+  1. The JSON object is rendered into a temporary string.
+  2. The byte payload is immediately transferred into a `SecureBuffer`.
+  3. `SecureMemory::zero()` wipes the temporary string's internal buffer, immune to compiler dead-code elimination.
+  4. The returned `SecureBuffer` guarantees automatic zeroization when destructed.
+* **Defensive Deserialization & `VaultCorruptError`:**
+  * `Vault::deserialize()` catches `nlohmann::json::exception` and validates field schemas.
+  * Malformed syntax, truncated payloads, or schema mismatches throw `VaultCorruptError` without crashing the application.
+
+#### E. End-to-End Vault Cryptographic Pipeline
+The architecture integrates Phase 3 and Phase 4 seamlessly:
+
+```
+ [In-Memory Vault]
+        │
+        ▼ (to_json() + memory scrubbing)
+ [SecureBuffer: Plaintext JSON]
+        │
+        ▼ (Argon2id Derived Key + Random Nonce + AAD)
+ [Cipher::encrypt()]
+        │
+        ▼
+ [CiphertextPackage (Ciphertext + 16-byte Poly1305 MAC)]
+        │
+        ▼ (Phase 5 Disk Persistence)
+ [Encrypted .vault Binary File on Disk]
+```
+
+#### F. Vault Unit Test Suite
+* **File:** [`tests/test_vault.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/tests/test_vault.cpp)
+* **Tests Implemented:**
+  1. `test_uuid()`: Validates RFC 4122 v4 format, character bounds, uniqueness across 200 draws, and rejection of invalid UUID strings.
+  2. `test_credential_entry()`: Tests initialization, accessors, timestamp tracking, move semantics, explicit `clone()`, and JSON roundtrip.
+  3. `test_vault_crud_and_search()`: Tests adding entries, UUID lookup, case-insensitive title search, username search, multi-field full-text search, updating entries, and deletion.
+  4. `test_vault_serialization_and_scrubbing()`: Verifies secure serialization to `SecureBuffer`, reconstruction via deserialization, and strict rejection of malformed/empty JSON payloads.
+  5. `test_integrated_vault_encryption()`: End-to-end integration test combining Phase 3 KDF + AEAD cipher with Phase 4 Vault serialization, verifying roundtrip decryption, wrong password rejection, and bit-flip tamper detection.
+
+---
+
+## 6. Detailed Project Roadmap & Status
+
+- [x] **Phase 1: Environment & Toolchain Foundation**
+  - Setup CMake build script with Windows security compiler flags (`/GS`, `/DYNAMICBASE`, `/NXCOMPAT`, `/guard:cf`, `/sdl`).
+  - Configure modular project directory layout (`include/`, `src/`, `tests/`, `deps/`).
+- [x] **Phase 2: Secure Memory & CSPRNG Subsystem**
+  - Implement `SecureMemory` with guaranteed zeroization (`SecureZeroMemory` / `sodium_memzero`) and RAM page pinning (`VirtualLock`).
+  - Implement `SecureBuffer` and `SecureString` with deleted copy semantics and automated RAII destruction.
+  - Implement `Random` CSPRNG wrapper with Windows CNG `BCryptGenRandom` and rejection-sampled unbiased integer generation.
+- [x] **Phase 3: Cryptographic Engine**
+  - Implement Key Derivation (Argon2id) taking password + salt -> 256-bit key with Windows CNG fallback.
+  - Implement Authenticated Encryption & Decryption (XChaCha20-Poly1305 / AES-256-GCM) with AAD support.
+  - Write test harness to verify roundtrip, bit-flip tamper rejection, and wrong password detection.
+- [x] **Phase 4: Vault Data Structure & Serialization**
+  - Implement RFC 4122 v4 `Uuid` generator and validator.
+  - Implement `CredentialEntry` domain model with `SecureString` password protection and deleted copy semantics.
+  - Implement `Vault` collection with full CRUD operations and case-insensitive search engine.
+  - In-memory serialization to `SecureBuffer` with defensive intermediate memory scrubbing.
+  - End-to-end integration test harness (`test_vault.cpp`) verifying crypto-vault pipeline.
+- [ ] **Phase 5: Storage Layer & Atomic Persistence**
+  - Binary file packaging (header, salt, nonce, tag, ciphertext).
+  - Atomic write-replace file persistence.
+- [ ] **Phase 6: Password Generator & Entropy Meter**
+  - Unbiased CSPRNG password generation with character set policies.
+  - Shannon / Pool-based entropy calculation ($E = L \times \log_2(R)$).
+- [ ] **Phase 7: CLI Interface & Terminal Security**
+  - Hidden terminal input for master password (suppressing console echo).
+  - Interactive CLI command loop (`init`, `unlock`, `add`, `list`, `get`, `lock`).
+
+---
+
+## 7. Comprehensive Lifecycle Breakdown of Every Phase
+
+This section provides the end-to-end breakdown of each phase across three essential architectural criteria:
+1. **What It Does (Functioning & Purpose)**
+2. **Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms)**
+3. **What It Lacks & What Is Needed Next (The Architectural Gap)**
+
+```
+ [Phase 1: Toolchain & Hardening]
+        │  Produces: Hardened binary environment & CMake targets
+        ▼
+ [Phase 2: Secure Memory & CSPRNG]
+        │  Produces: RAM zeroization, page pinning, true entropy
+        ▼
+ [Phase 3: Crypto Engine (KDF + AEAD)]
+        │  Produces: Password stretching (Argon2id) & tamper-proof encryption
+        ▼
+ [Phase 4: Vault Model & In-Memory Data]
+        │  Produces: Structured records (UUID, user, pass) & JSON scrub
+        ▼
+ [Phase 5: Storage Engine & Atomic I/O]
+        │  Produces: Binary file packaging & corruption-proof disk writes
+        ▼
+ [Phase 6: Password Generator & Entropy]
+        │  Produces: Unbiased random credentials & Shannon strength meter
+        ▼
+ [Phase 7: CLI Interface & Session Defense]
+        │  Produces: Echo-suppressed input, REPL shell & clipboard wiper
+        ▼
+ [Fully Realized, Hardened Password Manager]
+```
+
+---
+
+### Phase 1: Environment & Toolchain Foundation
+* **1. What It Does (Functioning & Purpose):**
+  * Establishes the automated compilation pipeline and injects low-level operating system exploit mitigations into the binary output before any functional C++ code is written.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Target-Based CMake (C++20):** Scoped compiler flags and dependency isolation (`target_include_directories`, `target_link_libraries`).
+  * **Compiler Stack Canaries (`/GS`):** Injects random cookies on stack frames to detect buffer overflow attacks before instruction pointer (`RIP`) hijacking.
+  * **Control Flow Guard (`/guard:cf`):** Microsoft exploit mitigation against Return-Oriented Programming (ROP) and indirect call hijacking.
+  * **Address Space Layout Randomization (`/DYNAMICBASE`, `/HIGHENTROPYVA`):** Randomizes memory addresses using full 64-bit entropy (up to 24 bits of address space randomization).
+  * **Data Execution Prevention (`/NXCOMPAT`):** Enforces CPU hardware `NX`/`XD` bits, marking heap/stack as strictly non-executable.
+  * **Automated Dependency Fetching:** CMake `FetchContent` subsystem for automated library vendoring (`nlohmann/json`).
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **Zero Functional Logic:** It is an empty project scaffolding. It lacks memory security, has no entropy generation, cannot derive keys, cannot encrypt anything, and has no data storage.
+
+---
+
+### Phase 2: Secure Memory & CSPRNG Subsystem
+* **1. What It Does (Functioning & Purpose):**
+  * Eliminates volatile memory forensic vulnerabilities. Ensures secrets are never left behind in RAM, never paged to unencrypted swap files on disk, and never duplicated across heap buffers, while providing unpredictable kernel entropy.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Compiler Dead-Code Immune Zeroization:** Calls `SecureZeroMemory` (Windows) and `sodium_memzero` (Libsodium) to prevent compilers from deleting buffer cleanups.
+  * **RAM Page Locking (`VirtualLock` / `VirtualUnlock`):** Interacts with Windows Virtual Memory Manager to lock physical pages and block paging to `pagefile.sys`.
+  * **Move-Only RAII Semantics:** Custom `SecureBuffer` and `SecureString` classes with deleted copy constructors (`= delete`) and `noexcept` move constructors to prevent duplicate plaintext secrets in heap memory.
+  * **OS Kernel Entropy Pools:** Direct integration with Windows Cryptography Next Generation (`BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`) and Libsodium `randombytes_buf`.
+  * **Rejection Sampling Algorithm:** Eliminates mathematical modulo bias in random integer generation: computes $\text{limit} = 2^{32} - (2^{32} \pmod{\text{range}})$ and discards values above the threshold to guarantee perfectly uniform probability distributions.
+  * **Zero-Copy Views:** Uses C++20 `std::span` for safe, non-owning memory slices.
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **No Cryptographic Transformation:** We have safe memory containers and random byte generators, but **no way to turn a master password into an encryption key** and **no cipher to encrypt or decrypt data**. Secrets cannot be mathematically protected.
+
+---
+
+### Phase 3: Cryptographic Engine (KDF + AEAD)
+* **1. What It Does (Functioning & Purpose):**
+  * Acts as the mathematical defense core of the vault. Stretches human-typed passwords into 256-bit symmetric keys with massive memory hardness, and performs authenticated symmetric encryption with tamper rejection.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Argon2id (Memory-Hard KDF):** Combines Argon2d (GPU/ASIC cracking resistance) and Argon2i (side-channel cache-timing resistance) with a 64 MB RAM profile and 3 sequential passes.
+  * **Windows CNG PBKDF2 Fallback:** `BCryptDeriveKeyPBKDF2` (HMAC-SHA256, 600,000 iterations) for zero-dependency compilation on Windows.
+  * **AEAD Symmetric Ciphers:** **XChaCha20-Poly1305** (192-bit nonce, 256-bit key) and **AES-256-GCM** (Galois/Counter Mode via Windows CNG `BCRYPT_CHAIN_MODE_GCM`).
+  * **Additional Authenticated Data (AAD):** Cryptographically binds plaintext file headers to the authentication tag without encrypting them, making header alterations immediately detectable.
+  * **Constant-Time Tag Verification:** Validates 16-byte Poly1305 / GHASH MAC tags and throws strict `AuthenticationError` exceptions upon bit-flips or wrong passwords.
+  * **Unit Test Harness:** [`tests/test_crypto.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/tests/test_crypto.cpp) testing memory zeroing, CSPRNG entropy, roundtrips, bit-flip tamper rejection, and invalid password detection.
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **No Domain Model or Vault Concept:** We can encrypt and decrypt raw arbitrary byte buffers, but the system has **no understanding of credentials**. It doesn't know what a "service", "username", "password", or "URL" is, and cannot organize multiple accounts in memory.
+
+---
+
+### Phase 4: Vault Data Structure & In-Memory Serialization
+* **1. What It Does (Functioning & Purpose):**
+  * Defines the application's domain model. Represents stored accounts as structured entities in memory, enables CRUD operations (Create, Read, Update, Delete) and search, and serializes the structured database into a flat string format (and vice versa) while scrubbing intermediate memory.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Credential Entity Model (`CredentialEntry`):** Stores UUID (RFC 4122 v4), service title, username, `SecureString` password, URL, notes, creation timestamp, and last-modified timestamp.
+  * **In-Memory Vault Container (`Vault`):** Manages credential records with methods: `add_entry()`, `find_by_title()`, `list_entries()`, `delete_entry()`, `update_entry()`.
+  * **JSON Serialization Engine (`nlohmann/json`):** Converts `Vault` $\leftrightarrow$ formatted text payload for encryption.
+  * **Intermediate Memory Scrubbing:** Automatically zeroes intermediate plaintext JSON strings and serialization buffers from RAM immediately after encryption is completed.
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **No Disk Persistence:** The entire vault exists **only in volatile RAM**. As soon as the program terminates, the computer reboots, or a crash occurs, **all stored user credentials are permanently destroyed**. There is no file on disk.
+
+---
+
+### Phase 5: Storage Engine & Atomic File Persistence
+* **1. What It Does (Functioning & Purpose):**
+  * Bridges the in-memory vault to physical disk storage. Packages the encrypted payload and metadata into a standardized binary file (`.vault`) and enforces crash-proof atomic writes.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Binary Vault Specification:** Custom binary layout packing magic bytes (`CPWM`), format version, KDF profile parameters, salt, nonce, authentication tag, and ciphertext.
+  * **Header Validation & AAD Integrity Check:** Validates headers and passes them as AAD into the cipher before processing payloads.
+  * **Atomic Write-Replace Pattern:** Writes new vault data to a temporary file (`.vault.tmp`), flushes file buffers to hardware (`FlushFileBuffers` / `fsync`), and atomically replaces the original file (`ReplaceFileW` / `std::filesystem::rename`), ensuring zero data corruption if power is cut mid-write.
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **No User Interface:** The engine can save and load encrypted vaults on disk, but there is **no way for a human user to interact with the software**. It cannot prompt for user input, cannot accept commands, and has no password generator to help users pick strong passwords.
+
+---
+
+### Phase 6: Password Generator & Entropy Meter
+* **1. What It Does (Functioning & Purpose):**
+  * Solves the human factor in security: humans are notorious for creating predictable, low-entropy passwords. Generates cryptographically strong random credentials and measures password strength mathematically.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Password Generator (`PasswordGenerator`):** Configurable character pools (uppercase, lowercase, numbers, symbols, and exclusion of ambiguous glyphs like `0/O`, `1/l/I`), utilizing rejection-sampled CSPRNG to ensure uniform character distribution without modulo skew.
+  * **Information-Theoretic Entropy Meter (`EntropyMeter`):** Calculates Shannon entropy ($E = L \times \log_2(R)$ bits) and classifies password strength (Weak < 50 bits, Moderate 50–70 bits, Strong > 70 bits).
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **No Secure Console UX:** The generator and strength calculator exist only as programmatic classes. The user still cannot invoke them interactively, enter their master password secretly without terminal echo, or copy passwords safely to their operating system clipboard.
+
+---
+
+### Phase 7: CLI Interface & Terminal Security
+* **1. What It Does (Functioning & Purpose):**
+  * Delivers the complete user-facing application. Provides a hardened terminal user experience that protects against shoulder-surfing, handles interactive user commands, auto-locks on inactivity, and safely handles clipboard transfers.
+* **2. Heavy Tech Inclusions (Technologies, Algorithms & Security Mechanisms):**
+  * **Echo-Suppressed Console Input:** Masks or hides typing when entering master passwords (`_getch()` on Windows or raw terminal mode on POSIX) to defeat shoulder-surfing and terminal screen scrapers.
+  * **Interactive REPL Shell:** Commands for `init`, `unlock`, `add`, `get`, `list`, `search`, `generate`, `lock`, `export`.
+  * **Auto-Lock Timeout:** Automatically locks the vault and scrubs keys from RAM after an idle period.
+  * **Clipboard Sanitizer:** Copies credentials to the Windows clipboard via Win32 API (`OpenClipboard` / `SetClipboardData`) and launches a timed asynchronous scrubber thread (`std::thread`, `std::chrono`) that wipes the clipboard after 30–45 seconds.
+* **3. What It Lacks & What Is Needed Next (The Architectural Gap):**
+  * **Nothing for a Core Security Product:** After Phase 7, the project is a 100% complete, fully functional, cryptographically robust, offline password manager.
+  * *Future Optional Expansions:* Graphical UI (Qt / Dear ImGui), local HTTP agent for browser extension autofill, or encrypted peer-to-peer cloud synchronization.
+
+
