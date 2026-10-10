@@ -78,6 +78,7 @@ set(CORE_SOURCES
     src/core/uuid.cpp
     src/core/credential.cpp
     src/core/vault.cpp
+    src/core/generator.cpp
     src/storage/vault_file.cpp
 )
 
@@ -113,3 +114,6 @@ target_link_libraries(run_vault_tests PRIVATE pwdmgr_core)
 
 add_executable(run_storage_tests tests/test_storage.cpp)
 target_link_libraries(run_storage_tests PRIVATE pwdmgr_core)
+
+add_executable(run_generator_tests tests/test_generator.cpp)
+target_link_libraries(run_generator_tests PRIVATE pwdmgr_core)

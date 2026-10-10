@@ -464,6 +464,66 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   6. `test_tamper_detection_header_aad()`: Flips 1 bit in header salt and asserts `AuthenticationError` is thrown due to AAD mismatch.
   7. `test_corrupted_header_size()`: Tests truncated files and asserts `InvalidHeaderError` is thrown.
 
+### 5.9 Password Generator & Entropy Meter Architecture
+
+#### A. Cryptographic Password Generation & Modulo Bias Elimination
+* **Headers & Source:** [`include/core/generator.hpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/include/core/generator.hpp) & [`src/core/generator.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/src/core/generator.cpp)
+* **The Vulnerability (Modulo Bias in Random Generation):**
+  * Naive password generators use standard `rand() % pool_size`. If $2^{32}$ is not evenly divisible by `pool_size`, lower remainder characters receive higher probability of selection, reducing search space and creating statistically exploitable biases in generated passwords.
+* **The Defense (Rejection Sampling & CSPRNG):**
+  * All character selections use `pwdmgr::crypto::Random::get_uniform_u32()`, which employs rejection sampling over OS kernel entropy (`BCryptGenRandom` / `randombytes_buf`), guaranteeing exact uniform probability $\frac{1}{R}$ across every possible character.
+* **Configurable Character Pools:**
+  * Lowercase: `a-z` (26 chars)
+  * Uppercase: `A-Z` (26 chars)
+  * Digits: `0-9` (10 chars)
+  * Special Symbols: `!@#$%^&*()-_=+[]{}|;:,.<>?` (27 chars)
+* **Ambiguous Character Filtering:**
+  * Visual confusion between characters (e.g., `0` vs `O` vs `o`, `1` vs `l` vs `I`, and `|`) leads to human transcription errors.
+  * Setting `exclude_ambiguous = true` scrubs these characters from all active pools.
+* **Strict Type Enforcement & Unbiased Fisher-Yates Shuffling:**
+  * When `require_each_type = true`, the generator explicitly draws one character from each enabled pool first, fills the remaining length from the unified pool, and performs a full **Fisher-Yates shuffle** using CSPRNG integers.
+  * This prevents predictable character positions (e.g., preventing uppercase letters from always appearing in the first slot).
+* **Volatile Memory Defense:**
+  * Generated passwords are encapsulated directly in `pwdmgr::crypto::SecureString`. Intermediate plaintext strings on the stack/heap are immediately sanitized with `pwdmgr::crypto::SecureMemory::zero()` before returning.
+
+#### B. Diceware Multi-Word Passphrase Generator
+* **Concept:**
+  * Passphrases constructed from random words separated by delimiters (e.g., `falcon-glacier-matrix-pulse-zenith`) offer massive entropy while remaining easy for humans to type and remember.
+* **Curated Wordlist:**
+  * Embeds 128 clean, phonetically distinct, memorable English words.
+  * Each word provides $\log_2(128) = 7.0$ bits of pure entropy.
+  * A 5-word passphrase delivers $\approx 35$ bits of base word entropy, expanding significantly when combined with custom separators.
+
+#### C. Information-Theoretic Entropy Meter Mathematics
+* **1. Pool-Based Entropy:**
+  $$E_{\text{pool}} = L \times \log_2(R) = L \times \frac{\ln(R)}{\ln(2)}$$
+  Where $L$ is password length, and $R$ is the size of the detected character set (cardinality: lowercase $= 26$, uppercase $= 26$, digits $= 10$, symbols $= 33$).
+* **2. Shannon Information Entropy:**
+  $$H = -\sum_{i=1}^{k} p(x_i) \log_2 p(x_i)$$
+  Where $p(x_i) = \frac{\text{frequency}(x_i)}{L}$. Calculates true average information density per character. Total Shannon entropy $= H \times L$.
+* **3. Pattern-Based Penalties:**
+  * **Repetitive Characters:** Consecutive identical characters (e.g., `aaaa`) reduce search space; penalized by $2.5$ bits per duplicate.
+  * **Sequential Sequences:** Alphabetical or numerical sequences (e.g., `abc`, `123`) penalized by $4.0$ bits per sequence.
+  * **Effective Entropy:** Computed as $\max(0, \min(E_{\text{pool}}, E_{\text{shannon}}) - \text{penalties})$.
+* **4. Strength Classification Levels:**
+  * **Very Weak:** $< 40$ bits (crackable in seconds)
+  * **Weak:** $40 - 59$ bits (crackable in hours/days)
+  * **Moderate:** $60 - 79$ bits (resistant to basic online/offline attacks)
+  * **Strong:** $80 - 99$ bits (resistant to high-end GPU clusters)
+  * **Very Strong:** $\ge 100$ bits (cryptographically intractable, millions of years)
+* **5. Crack Time Estimation:**
+  * **Offline Cracking Rig:** $T = \frac{2^E}{10^{10}}$ seconds (assuming $10$ billion hashes/second on a multi-GPU hashcat rig).
+  * **Online Rate-Limited Login:** $T = \frac{2^E}{100}$ seconds (assuming $100$ authentication requests/second).
+
+#### D. Generator Unit Test Suite
+* **File:** [`tests/test_generator.cpp`](file:///c:/Users/Pratyush/PratyushDox/CyberSecurityProjects/ClientPasswordManager/tests/test_generator.cpp)
+* **Tests Implemented:**
+  1. `test_password_generator_basic()`: Verifies 20-character default generation and presence of all character classes.
+  2. `test_password_generator_options()`: Validates PIN mode (digits only), alphanumeric mode, and complete exclusion of ambiguous glyphs.
+  3. `test_passphrase_generation()`: Verifies Diceware passphrases with custom separators and word counts.
+  4. `test_entropy_meter_evaluation()`: Verifies Shannon entropy, strength level mapping, and penalties for repeats/sequences.
+  5. `test_generator_invalid_inputs()`: Verifies rejection of zero-length requests, empty pool options, and zero word counts.
+
 ---
 
 ## 6. Detailed Project Roadmap & Status
@@ -491,9 +551,14 @@ The architecture integrates Phase 3 and Phase 4 seamlessly:
   - Atomic write-replace disk persistence (`ReplaceFileW` / `FlushFileBuffers`).
   - Header inspection without decryption (`read_header`, `is_vault_file`).
   - Comprehensive storage test harness (`test_storage.cpp`) testing bit-flips, AAD tampering, and atomic swaps.
-- [ ] **Phase 6: Password Generator & Entropy Meter**
-  - Unbiased CSPRNG password generation with character set policies.
-  - Shannon / Pool-based entropy calculation ($E = L \times \log_2(R)$).
+- [x] **Phase 6: Password Generator & Entropy Meter**
+  - Unbiased CSPRNG character generation eliminating modulo bias.
+  - Configurable options: character pools, ambiguous glyph exclusion, and strict type presence.
+  - Diceware multi-word passphrase generator with customizable delimiters.
+  - Information-theoretic Shannon entropy ($H$) and pool entropy ($E = L \times \log_2(R)$) calculator.
+  - Pattern penalties for duplicate and sequential characters.
+  - Brute-force crack time estimation for offline GPU rigs and online rate-limited services.
+  - Comprehensive generator test suite (`test_generator.cpp`).
 - [ ] **Phase 7: CLI Interface & Terminal Security**
   - Hidden terminal input for master password (suppressing console echo).
   - Interactive CLI command loop (`init`, `unlock`, `add`, `list`, `get`, `lock`).
