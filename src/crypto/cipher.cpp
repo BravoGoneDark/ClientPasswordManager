@@ -12,9 +12,16 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+
+#ifndef STATUS_AUTH_TAG_MISMATCH
+#define STATUS_AUTH_TAG_MISMATCH ((NTSTATUS)0xC000A002L)
+#endif
 #endif
 
 namespace pwdmgr::crypto {

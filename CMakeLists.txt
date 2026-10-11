@@ -90,6 +90,11 @@ target_include_directories(pwdmgr_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/deps"
 )
 
+target_compile_definitions(pwdmgr_core PUBLIC
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
 if (TARGET nlohmann_json::nlohmann_json)
     target_link_libraries(pwdmgr_core PUBLIC nlohmann_json::nlohmann_json)
 endif()

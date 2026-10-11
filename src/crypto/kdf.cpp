@@ -44,6 +44,7 @@ SecureBuffer KDF::derive_key(
         throw std::runtime_error("Argon2id key derivation failed (insufficient memory or invalid params)");
     }
 #elif defined(_WIN32)
+    (void)params; // Unused in PBKDF2 fallback mode
     // Windows CNG PBKDF2-HMAC-SHA256 fallback when libsodium is not yet linked
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     NTSTATUS status = BCryptOpenAlgorithmProvider(

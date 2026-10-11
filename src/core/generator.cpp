@@ -232,7 +232,7 @@ EntropyScore EntropyMeter::evaluate(std::string_view password) {
     score.shannon_entropy_bits = calculate_shannon_entropy(password) * static_cast<double>(len);
 
     // Baseline effective entropy starts at the lesser of pool and shannon entropy
-    double effective = std::min(score.pool_entropy_bits, score.shannon_entropy_bits);
+    double effective = (std::min)(score.pool_entropy_bits, score.shannon_entropy_bits);
 
     // 1. Repetitive character penalty
     size_t repeat_count = 0;
@@ -263,7 +263,7 @@ EntropyScore EntropyMeter::evaluate(std::string_view password) {
         score.suggestions.push_back("Avoid sequential patterns (e.g. abc, 123).");
     }
 
-    score.effective_entropy_bits = std::max(0.0, effective);
+    score.effective_entropy_bits = (std::max)(0.0, effective);
 
     // 3. Classify Strength Level
     if (score.effective_entropy_bits < 40.0) {
